@@ -14,6 +14,18 @@ replace them with your Atlas settings if needed.
 The MongoDB connection uses Certifi's trusted CA bundle for TLS certificate
 verification.
 
+## Desktop app
+
+Launch the Tkinter desktop interface with:
+
+```bash
+python desktop_app.py
+```
+
+The desktop app connects directly to the configured MongoDB database and
+provides searchable create, read, update, and delete screens for all seven
+collections. It does not require the FastAPI server to be running.
+
 For MongoDB Atlas, verify that the cluster is running, the URI is the current
 Atlas connection string, and the machine running the API is allowed in the
 cluster's Network Access IP access list. A TLS handshake failure or a
