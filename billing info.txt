@@ -1,0 +1,6 @@
+paitent id;
+doctor id;
+payment mode
+amount; int
+time; hhmmss
+status; enum

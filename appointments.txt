@@ -1,0 +1,5 @@
+doctor id; 
+paitent id;
+date;dd;mm;yyyy
+time; hhmmss
+fees; integer

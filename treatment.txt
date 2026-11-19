@@ -1,0 +1,9 @@
+doctor id;
+paitent id;
+treatment type; enum
+treatment status; enum
+medicine_name ; array(str)
+dosage; array(hhmmss)
+frequency; array(int)
+duration_days ; int
+instructions ; str

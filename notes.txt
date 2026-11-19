@@ -1,0 +1,7 @@
+patient information
+doctor details 
+appointments 
+medical records 
+prescriptions 
+treatment
+billing information. 
