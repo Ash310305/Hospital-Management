@@ -1,8 +1,10 @@
 import json
+import re
 import threading
 import tkinter as tk
+from calendar import month_name, monthrange
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from enum import Enum
 from tkinter import messagebox, ttk
 from typing import Any, get_args, get_origin
@@ -28,6 +30,10 @@ COLORS = {
     "border": "#24344B",
     "text": "#EFF5FC",
     "muted": "#8FA2B9",
+    "input": "#F8FAFC",
+    "input_text": "#17243A",
+    "input_muted": "#465B75",
+    "input_border": "#B5C4D5",
     "green": "#72E0B2",
     "teal": "#67D5D0",
     "blue": "#8CB8FF",
@@ -153,9 +159,44 @@ def format_field_value(value: Any) -> str:
 def format_form_value(field: Any, value: Any, model: type[BaseModel]) -> str:
     if isinstance(value, datetime) and _unwrap_optional(field.annotation) is date:
         value = value.date()
-    if model is Appointment and field.alias == "date" and isinstance(value, date):
-        return value.strftime("%d-%m-%Y")
+    if isinstance(value, time) and _unwrap_optional(field.annotation) is time:
+        return value.strftime("%I:%M %p")
     return format_field_value(value)
+
+
+def parse_time_input(value: str) -> time:
+    value = value.strip()
+    for time_format in ("%I:%M %p", "%I:%M:%S %p", "%H:%M", "%H:%M:%S", "%H%M%S"):
+        try:
+            return datetime.strptime(value.upper(), time_format).time()
+        except ValueError:
+            continue
+    raise ValueError("Enter a valid time as HH:MM AM/PM or HH:MM (24-hour).")
+
+
+def parse_date_input(value: str) -> date:
+    value = value.strip()
+    for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(value, date_format).date()
+        except ValueError:
+            continue
+    raise ValueError("Enter a valid date as YYYY-MM-DD or DD/MM/YYYY.")
+
+
+def shift_month(value: date, offset: int) -> date:
+    month_index = value.month - 1 + offset
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, 1)
+
+
+def summarize_counts(counts: dict[str, int]) -> dict[str, int]:
+    return {
+        "patients": counts.get("patients", 0),
+        "doctors": counts.get("doctors", 0),
+        "total": sum(counts.values()),
+    }
 
 
 def validate_form_data(model: type[BaseModel], values: dict[str, Any]) -> BaseModel:
@@ -167,6 +208,8 @@ def validate_form_data(model: type[BaseModel], values: dict[str, Any]) -> BaseMo
         if value == "":
             if field.is_required():
                 cleaned[name] = value
+            elif field.default_factory is not None:
+                cleaned[name] = field.default_factory()
             else:
                 cleaned[name] = None
             continue
@@ -176,16 +219,39 @@ def validate_form_data(model: type[BaseModel], values: dict[str, Any]) -> BaseMo
             enum_class = _enum_type(field.annotation)
             assert enum_class is not None
             cleaned[name] = enum_class(value)
-        elif get_origin(annotation) in (list, dict):
-            cleaned[name] = json.loads(value)
+        elif get_origin(annotation) is list:
+            try:
+                cleaned[name] = json.loads(value)
+            except json.JSONDecodeError:
+                item_type = get_args(annotation)[0] if get_args(annotation) else str
+                if item_type is str:
+                    cleaned[name] = [
+                        item.strip()
+                        for item in re.split(r"[,;\n]", value)
+                        if item.strip()
+                    ]
+                else:
+                    raise ValueError(
+                        f"{name.replace('_', ' ').capitalize()} must be a valid JSON "
+                        "array containing correctly formatted values."
+                    )
+        elif get_origin(annotation) is dict:
+            try:
+                cleaned[name] = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"{name.replace('_', ' ').capitalize()} must contain valid JSON."
+                ) from error
         elif annotation is bool:
             cleaned[name] = value.lower() in ("true", "1", "yes", "on")
         elif annotation is int:
             cleaned[name] = int(value)
         elif annotation is float:
             cleaned[name] = float(value)
-        elif annotation is date and model is Appointment:
-            cleaned[name] = datetime.strptime(value, "%d-%m-%Y").date()
+        elif annotation is date:
+            cleaned[name] = parse_date_input(value)
+        elif annotation is time:
+            cleaned[name] = parse_time_input(value)
     return model.model_validate(cleaned)
 
 
@@ -194,6 +260,341 @@ def record_to_mongo(model: BaseModel) -> dict:
     if converter is not None:
         return converter()
     return model.model_dump(mode="python")
+
+
+class CalendarPicker(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        initial_date: date | None,
+        on_select,
+        allow_clear: bool = False,
+    ):
+        super().__init__(parent)
+        self.selected_date = initial_date
+        self.visible_month = (initial_date or date.today()).replace(day=1)
+        self.on_select = on_select
+        self.allow_clear = allow_clear
+        self.title("Choose date")
+        self.configure(background=COLORS["surface"])
+        self.transient(parent)
+        self.resizable(False, False)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.bind("<Left>", lambda _event: self._move_selection(-1))
+        self.bind("<Right>", lambda _event: self._move_selection(1))
+        self.bind("<Up>", lambda _event: self._move_selection(-7))
+        self.bind("<Down>", lambda _event: self._move_selection(7))
+        self.bind("<Return>", lambda _event: self._choose(self.selected_date) if self.selected_date else None)
+        self.grab_set()
+        self.calendar_body = tk.Frame(self, bg=COLORS["surface"])
+        self.calendar_body.pack(padx=16, pady=14)
+        self._render()
+        self.update_idletasks()
+        self._place_near_parent(parent)
+
+    def _render(self):
+        for widget in self.calendar_body.winfo_children():
+            widget.destroy()
+
+        navigation = tk.Frame(self.calendar_body, bg=COLORS["surface"])
+        navigation.pack(fill="x", pady=(0, 12))
+        self._calendar_button(
+            navigation, "‹", lambda: self._change_month(-1), width=3
+        ).pack(side="left")
+        month_var = tk.StringVar(value=month_name[self.visible_month.month])
+        month_picker = ttk.Combobox(
+            navigation,
+            textvariable=month_var,
+            values=[month_name[index] for index in range(1, 13)],
+            state="readonly",
+            width=11,
+            style="Light.TCombobox",
+        )
+        month_picker.pack(side="left", padx=(8, 4))
+        month_picker.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._select_month(month_picker.current() + 1),
+        )
+        year_picker_var = tk.StringVar(value=str(self.visible_month.year))
+        year_picker = tk.Spinbox(
+            navigation,
+            from_=1900,
+            to=2100,
+            width=6,
+            textvariable=year_picker_var,
+            command=lambda: self._select_year(year_picker_var.get()),
+            bg=COLORS["input"],
+            fg=COLORS["input_text"],
+            buttonbackground=COLORS["input"],
+            insertbackground=COLORS["input_text"],
+            selectbackground=COLORS["blue"],
+            selectforeground=COLORS["input_text"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+            font=("Helvetica Neue", 10),
+        )
+        year_picker.pack(side="left", padx=(4, 8), ipady=5)
+        year_picker.bind(
+            "<Return>",
+            lambda _event: self._select_year(year_picker_var.get()),
+        )
+        self._calendar_button(
+            navigation, "›", lambda: self._change_month(1), width=3
+        ).pack(side="right")
+
+        grid = tk.Frame(self.calendar_body, bg=COLORS["surface"])
+        grid.pack()
+        for column, weekday in enumerate(("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")):
+            tk.Label(
+                grid,
+                text=weekday,
+                bg=COLORS["surface"],
+                fg=COLORS["muted"],
+                width=4,
+                font=("Helvetica Neue", 9, "bold"),
+            ).grid(row=0, column=column, pady=(0, 6))
+
+        first_weekday, day_count = monthrange(self.visible_month.year, self.visible_month.month)
+        for day in range(1, day_count + 1):
+            position = first_weekday + day - 1
+            chosen = date(self.visible_month.year, self.visible_month.month, day)
+            is_selected = chosen == self.selected_date
+            is_today = chosen == date.today()
+            button = self._calendar_button(
+                grid,
+                str(day),
+                lambda selected=chosen: self._choose(selected),
+                selected=is_selected,
+                today=is_today,
+            )
+            button.grid(row=position // 7 + 1, column=position % 7, padx=1, pady=1)
+
+        footer = tk.Frame(self.calendar_body, bg=COLORS["surface"])
+        footer.pack(fill="x", pady=(10, 0))
+        if self.allow_clear:
+            self._calendar_button(
+                footer,
+                "Clear date",
+                lambda: self._choose(None),
+                foreground=COLORS["red"],
+            ).pack(side="left")
+        self._calendar_button(
+            footer,
+            "Today",
+            lambda: self._choose(date.today()),
+            foreground=COLORS["teal"],
+        ).pack(side="right")
+
+    def _calendar_button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        *,
+        width: int = 4,
+        selected: bool = False,
+        today: bool = False,
+        foreground: str | None = None,
+    ) -> tk.Button:
+        background = "#245447" if selected else COLORS["surface_light"]
+        if today and not selected:
+            background = "#223955"
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=background,
+            fg=foreground or (COLORS["green"] if selected or today else COLORS["text"]),
+            activebackground=COLORS["surface_hover"],
+            activeforeground=COLORS["text"],
+            disabledforeground=COLORS["muted"],
+            relief="flat",
+            bd=0,
+            width=width,
+            padx=5,
+            pady=6,
+            font=("Helvetica Neue", 10, "bold" if selected or today else "normal"),
+            cursor="hand2",
+            takefocus=True,
+        )
+
+    def _change_month(self, offset: int):
+        self.visible_month = shift_month(self.visible_month, offset)
+        self._render()
+
+    def _select_month(self, month: int):
+        self.visible_month = self.visible_month.replace(month=month)
+        self._render()
+
+    def _select_year(self, year: str):
+        try:
+            parsed_year = int(year)
+            if not 1 <= parsed_year <= 9999:
+                raise ValueError
+        except ValueError:
+            self.bell()
+            self._render()
+            return
+        self.visible_month = self.visible_month.replace(year=parsed_year)
+        self._render()
+
+    def _move_selection(self, days: int):
+        current = self.selected_date or date.today()
+        self.selected_date = current + timedelta(days=days)
+        self.visible_month = self.selected_date.replace(day=1)
+        self._render()
+
+    def _place_near_parent(self, parent: tk.Misc):
+        x = parent.winfo_rootx() + 90
+        y = parent.winfo_rooty() + 100
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = min(max(8, x), max(8, screen_width - self.winfo_width() - 8))
+        y = min(max(8, y), max(8, screen_height - self.winfo_height() - 8))
+        self.geometry(f"+{x}+{y}")
+        self.lift()
+        self.focus_force()
+
+    def _choose(self, selected: date | None):
+        self.on_select(selected)
+        self.destroy()
+
+
+class TimePicker(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, initial_time: time | None, on_select):
+        super().__init__(parent)
+        initial = initial_time or time(9, 0)
+        self.on_select = on_select
+        self.title("Choose visiting time")
+        self.configure(background=COLORS["surface"])
+        self.transient(parent)
+        self.resizable(False, False)
+        self.grab_set()
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.bind("<Return>", lambda _event: self._choose())
+
+        body = tk.Frame(
+            self,
+            bg=COLORS["surface"],
+            highlightbackground=COLORS["border"],
+            highlightthickness=1,
+        )
+        body.pack(padx=16, pady=16)
+        tk.Label(
+            body,
+            text="Choose visiting time",
+            bg=COLORS["surface"],
+            fg=COLORS["text"],
+            font=("Helvetica Neue", 15, "bold"),
+        ).pack(anchor="w", padx=20, pady=(18, 5))
+        tk.Label(
+            body,
+            text="Select a time using the clock controls.",
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            font=("Helvetica Neue", 10),
+        ).pack(anchor="w", padx=20, pady=(0, 16))
+
+        controls = tk.Frame(body, bg=COLORS["surface"])
+        controls.pack(padx=20, pady=(0, 18))
+        self.hour_var = tk.StringVar(value=str(initial.hour % 12 or 12))
+        self.minute_var = tk.StringVar(value=f"{initial.minute:02d}")
+        self.period_var = tk.StringVar(value="AM" if initial.hour < 12 else "PM")
+
+        self._clock_label(controls, "HOUR", 0)
+        self._clock_label(controls, "MINUTE", 1)
+        self._clock_label(controls, "PERIOD", 2)
+
+        hour = tk.Spinbox(
+            controls,
+            from_=1,
+            to=12,
+            wrap=True,
+            width=4,
+            textvariable=self.hour_var,
+            bg=COLORS["input"],
+            fg=COLORS["input_text"],
+            buttonbackground=COLORS["input"],
+            insertbackground=COLORS["input_text"],
+            selectbackground=COLORS["blue"],
+            selectforeground=COLORS["input_text"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+            font=("Helvetica Neue", 17, "bold"),
+            justify="center",
+        )
+        hour.grid(row=1, column=0, padx=(0, 8), ipady=7)
+        minute = ttk.Combobox(
+            controls,
+            textvariable=self.minute_var,
+            values=[f"{value:02d}" for value in range(60)],
+            state="readonly",
+            width=4,
+            style="Light.TCombobox",
+            font=("Helvetica Neue", 15),
+            justify="center",
+        )
+        minute.grid(row=1, column=1, padx=8, ipady=7)
+        period = ttk.Combobox(
+            controls,
+            textvariable=self.period_var,
+            values=("AM", "PM"),
+            state="readonly",
+            width=5,
+            style="Light.TCombobox",
+            font=("Helvetica Neue", 13, "bold"),
+            justify="center",
+        )
+        period.grid(row=1, column=2, padx=(8, 0), ipady=7)
+
+        footer = tk.Frame(body, bg=COLORS["surface"])
+        footer.pack(fill="x", padx=20, pady=(0, 18))
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(
+            footer,
+            text="Use this time",
+            style="Accent.TButton",
+            command=self._choose,
+        ).pack(side="right")
+        self.update_idletasks()
+        self._place_near_parent(parent)
+        hour.focus_set()
+
+    @staticmethod
+    def _clock_label(parent: tk.Misc, label: str, column: int):
+        tk.Label(
+            parent,
+            text=label,
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            font=("Helvetica Neue", 8, "bold"),
+        ).grid(row=0, column=column, pady=(0, 6))
+
+    def _place_near_parent(self, parent: tk.Misc):
+        x = parent.winfo_rootx() + 90
+        y = parent.winfo_rooty() + 100
+        x = min(max(8, x), max(8, self.winfo_screenwidth() - self.winfo_width() - 8))
+        y = min(max(8, y), max(8, self.winfo_screenheight() - self.winfo_height() - 8))
+        self.geometry(f"+{x}+{y}")
+        self.lift()
+        self.focus_force()
+
+    def _choose(self):
+        try:
+            hour = int(self.hour_var.get())
+            minute = int(self.minute_var.get())
+            period = self.period_var.get()
+            if not 1 <= hour <= 12 or not 0 <= minute <= 59 or period not in ("AM", "PM"):
+                raise ValueError
+        except ValueError:
+            self.bell()
+            return
+
+        hour = hour % 12 + (12 if period == "PM" else 0)
+        self.on_select(time(hour, minute))
+        self.destroy()
 
 
 class RecordForm(tk.Toplevel):
@@ -290,14 +691,79 @@ class RecordForm(tk.Toplevel):
 
         enum_class = _enum_type(field.annotation)
         base_type = _unwrap_optional(field.annotation)
-        if enum_class:
+        if base_type is time:
+            control = tk.Frame(row, bg=COLORS["surface"])
+            control.pack(fill="x")
+            variable = tk.StringVar(
+                value=format_form_value(field, current, self.resource.model)
+            )
+            widget = ttk.Entry(control, textvariable=variable, style="Light.TEntry")
+            widget.pack(side="left", fill="x", expand=True, ipady=7)
+            tk.Button(
+                control,
+                text="◷  Choose time",
+                command=lambda var=variable: self._open_time_picker(var),
+                bg=COLORS["surface_light"],
+                fg=COLORS["green"],
+                activebackground=COLORS["surface_hover"],
+                activeforeground=COLORS["text"],
+                relief="flat",
+                bd=0,
+                padx=12,
+                pady=9,
+                font=("Helvetica Neue", 9, "bold"),
+                cursor="hand2",
+            ).pack(side="left", padx=(6, 0))
+            self.inputs[name] = variable
+            tk.Label(
+                row,
+                text="Enter HH:MM AM/PM or choose a time.",
+                bg=COLORS["surface"],
+                fg=COLORS["muted"],
+                font=("Helvetica Neue", 9),
+            ).pack(anchor="w", pady=(4, 0))
+        elif base_type is date:
+            control = tk.Frame(row, bg=COLORS["surface"])
+            control.pack(fill="x")
+            variable = tk.StringVar(
+                value=format_form_value(field, current, self.resource.model)
+            )
+            widget = ttk.Entry(control, textvariable=variable, style="Light.TEntry")
+            widget.pack(side="left", fill="x", expand=True, ipady=7)
+            calendar_button = tk.Button(
+                control,
+                text="▦  Choose date",
+                command=lambda var=variable, optional=not field.is_required(): self._open_calendar(
+                    var, optional
+                ),
+                bg=COLORS["surface_light"],
+                fg=COLORS["green"],
+                activebackground=COLORS["surface_hover"],
+                activeforeground=COLORS["text"],
+                relief="flat",
+                bd=0,
+                padx=12,
+                pady=9,
+                font=("Helvetica Neue", 9, "bold"),
+                cursor="hand2",
+            )
+            calendar_button.pack(side="left", padx=(6, 0))
+            self.inputs[name] = variable
+            tk.Label(
+                row,
+                text="Enter DD/MM/YYYY or YYYY-MM-DD, or choose a date.",
+                bg=COLORS["surface"],
+                fg=COLORS["muted"],
+                font=("Helvetica Neue", 9),
+            ).pack(anchor="w", pady=(4, 0))
+        elif enum_class:
             variable = tk.StringVar(value=format_field_value(current))
             widget = ttk.Combobox(
                 row,
                 textvariable=variable,
                 values=[str(option.value) for option in enum_class],
                 state="readonly",
-                style="Dark.TCombobox",
+                style="Light.TCombobox",
             )
             widget.pack(fill="x")
             self.inputs[name] = variable
@@ -311,10 +777,14 @@ class RecordForm(tk.Toplevel):
                 row,
                 height=4,
                 wrap="word",
-                bg=COLORS["surface_light"],
-                fg=COLORS["text"],
-                insertbackground=COLORS["text"],
+                bg=COLORS["input"],
+                fg=COLORS["input_text"],
+                insertbackground=COLORS["input_text"],
+                selectbackground=COLORS["blue"],
+                selectforeground=COLORS["input_text"],
                 relief="flat",
+                highlightthickness=1,
+                highlightbackground=COLORS["input_border"],
                 font=("SF Mono", 10),
                 padx=10,
                 pady=8,
@@ -327,7 +797,7 @@ class RecordForm(tk.Toplevel):
             self.inputs[name] = widget
             tk.Label(
                 row,
-                text="Enter valid JSON (for example: [\"item one\", \"item two\"]).",
+                text="Enter JSON, or separate simple text values with commas or new lines.",
                 bg=COLORS["surface"],
                 fg=COLORS["muted"],
                 font=("Helvetica Neue", 9),
@@ -336,9 +806,32 @@ class RecordForm(tk.Toplevel):
             variable = tk.StringVar(
                 value=format_form_value(field, current, self.resource.model)
             )
-            widget = ttk.Entry(row, textvariable=variable, style="Dark.TEntry")
+            widget = ttk.Entry(row, textvariable=variable, style="Light.TEntry")
             widget.pack(fill="x", ipady=7)
             self.inputs[name] = variable
+
+    def _open_calendar(self, variable: tk.StringVar, allow_clear: bool = False):
+        try:
+            initial_date = parse_date_input(variable.get()) if variable.get().strip() else None
+        except ValueError:
+            initial_date = None
+        CalendarPicker(
+            self,
+            initial_date,
+            lambda selected: variable.set(selected.isoformat() if selected else ""),
+            allow_clear=allow_clear,
+        )
+
+    def _open_time_picker(self, variable: tk.StringVar):
+        try:
+            initial_time = parse_time_input(variable.get()) if variable.get().strip() else None
+        except ValueError:
+            initial_time = None
+        TimePicker(
+            self,
+            initial_time,
+            lambda selected: variable.set(selected.strftime("%I:%M %p")),
+        )
 
     def _save(self):
         values = {}
@@ -370,10 +863,10 @@ class HospitalDesktopApp:
         self.search_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Connecting to database…")
         self.count_vars: dict[str, tk.StringVar] = {}
+        self.dashboard_vars: dict[str, tk.StringVar] = {}
         self._configure_style()
         self._build_shell()
         self._show_overview()
-        self._refresh_counts()
 
     def _configure_style(self):
         style = ttk.Style(self.root)
@@ -422,27 +915,46 @@ class HospitalDesktopApp:
         )
         style.map("Accent.TButton", background=[("active", "#78E0B5")])
         style.configure(
-            "Dark.TEntry",
-            fieldbackground=COLORS["surface_light"],
-            foreground=COLORS["text"],
-            insertcolor=COLORS["text"],
+            "Light.TEntry",
+            fieldbackground=COLORS["input"],
+            foreground=COLORS["input_text"],
+            insertcolor=COLORS["input_text"],
+            bordercolor=COLORS["input_border"],
+            lightcolor=COLORS["input_border"],
+            darkcolor=COLORS["input_border"],
+            selectbackground=COLORS["blue"],
+            selectforeground=COLORS["input_text"],
             borderwidth=0,
             padding=(10, 9),
         )
         style.configure(
-            "Dark.TCombobox",
-            fieldbackground=COLORS["surface_light"],
-            background=COLORS["surface_light"],
-            foreground=COLORS["text"],
-            arrowcolor=COLORS["green"],
+            "Light.TCombobox",
+            fieldbackground=COLORS["input"],
+            background=COLORS["input"],
+            foreground=COLORS["input_text"],
+            arrowcolor=COLORS["input_text"],
+            bordercolor=COLORS["input_border"],
+            lightcolor=COLORS["input_border"],
+            darkcolor=COLORS["input_border"],
+            selectbackground=COLORS["blue"],
+            selectforeground=COLORS["input_text"],
             borderwidth=0,
             padding=(8, 8),
         )
         style.map(
-            "Dark.TCombobox",
-            fieldbackground=[("readonly", COLORS["surface_light"])],
-            foreground=[("readonly", COLORS["text"])],
+            "Light.TCombobox",
+            fieldbackground=[
+                ("readonly", COLORS["input"]),
+                ("focus", COLORS["input"]),
+            ],
+            foreground=[("readonly", COLORS["input_text"])],
+            selectbackground=[("readonly", COLORS["input"])],
+            selectforeground=[("readonly", COLORS["input_text"])],
         )
+        self.root.option_add("*TCombobox*Listbox.background", COLORS["input"])
+        self.root.option_add("*TCombobox*Listbox.foreground", COLORS["input_text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["blue"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", COLORS["input_text"])
         style.configure(
             "Vertical.TScrollbar",
             background=COLORS["surface_light"],
@@ -668,6 +1180,40 @@ class HospitalDesktopApp:
             font=("Helvetica Neue", 10),
         ).pack(anchor="w", pady=(5, 0))
 
+        metrics = tk.Frame(self.content, bg=COLORS["background"])
+        metrics.pack(fill="x", pady=(0, 18))
+        for column in range(3):
+            metrics.grid_columnconfigure(column, weight=1, uniform="metrics")
+        for column, (key, label, accent) in enumerate(
+            (
+                ("patients", "TOTAL PATIENTS", COLORS["green"]),
+                ("doctors", "TOTAL DOCTORS", COLORS["blue"]),
+                ("total", "TOTAL RECORDS", COLORS["purple"]),
+            )
+        ):
+            metric = tk.Frame(
+                metrics,
+                bg=COLORS["surface"],
+                highlightbackground=COLORS["border"],
+                highlightthickness=1,
+            )
+            metric.grid(row=0, column=column, sticky="nsew", padx=(0, 12))
+            self.dashboard_vars[key] = tk.StringVar(value="—")
+            tk.Label(
+                metric,
+                text=label,
+                bg=COLORS["surface"],
+                fg=COLORS["muted"],
+                font=("Helvetica Neue", 9, "bold"),
+            ).pack(anchor="w", padx=16, pady=(13, 3))
+            tk.Label(
+                metric,
+                textvariable=self.dashboard_vars[key],
+                bg=COLORS["surface"],
+                fg=accent,
+                font=("Helvetica Neue", 24, "bold"),
+            ).pack(anchor="w", padx=16, pady=(0, 12))
+
         cards = tk.Frame(self.content, bg=COLORS["background"])
         cards.pack(fill="x")
         for column in range(3):
@@ -725,14 +1271,6 @@ class HospitalDesktopApp:
             ).pack(anchor="w")
             self._bind_card(card, resource)
 
-    def _bind_card(self, widget: tk.Widget, resource: Resource):
-        widget.bind(
-            "<Button-1>",
-            lambda _event, selected=resource: self.show_resource(selected),
-        )
-        for child in widget.winfo_children():
-            self._bind_card(child, resource)
-
         note = tk.Frame(
             self.content,
             bg=COLORS["surface"],
@@ -742,18 +1280,33 @@ class HospitalDesktopApp:
         note.pack(fill="x", pady=(4, 0))
         tk.Label(
             note,
-            text="  DATABASE",
+            text="DATABASE",
             bg=COLORS["surface"],
             fg=COLORS["teal"],
             font=("Helvetica Neue", 8, "bold"),
         ).pack(anchor="w", padx=16, pady=(14, 3))
         tk.Label(
             note,
-            text="  Changes are saved directly to your configured MongoDB database.",
+            text="Changes are saved directly to your configured MongoDB database.",
             bg=COLORS["surface"],
             fg=COLORS["muted"],
             font=("Helvetica Neue", 10),
         ).pack(anchor="w", padx=16, pady=(0, 14))
+        ttk.Button(
+            note,
+            text="Refresh totals",
+            command=self._refresh_counts,
+        ).place(relx=1.0, x=-16, y=12, anchor="ne")
+
+        self._refresh_counts()
+
+    def _bind_card(self, widget: tk.Widget, resource: Resource):
+        widget.bind(
+            "<Button-1>",
+            lambda _event, selected=resource: self.show_resource(selected),
+        )
+        for child in widget.winfo_children():
+            self._bind_card(child, resource)
 
     def show_resource(self, resource: Resource):
         self.current_resource = resource
@@ -765,7 +1318,7 @@ class HospitalDesktopApp:
         search = ttk.Entry(
             toolbar,
             textvariable=self.search_var,
-            style="Dark.TEntry",
+            style="Light.TEntry",
             width=38,
         )
         search.pack(side="left", fill="x", expand=True, ipady=4)
@@ -863,6 +1416,10 @@ class HospitalDesktopApp:
             }
 
         def show_counts(counts):
+            totals = summarize_counts(counts)
+            for key, total in totals.items():
+                if key in self.dashboard_vars:
+                    self.dashboard_vars[key].set(f"{total:,}")
             for key, count in counts.items():
                 if key in self.count_vars:
                     self.count_vars[key].set(str(count))
