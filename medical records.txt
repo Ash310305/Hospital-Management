@@ -1,6 +1,0 @@
-paitent id;
-blood group;
-chronic conditions; list(str)
-Height; integer
-Weight; integer
-immunization history; list(dict)
